@@ -9,7 +9,7 @@ class DellinApi
     private $login;
     private $password;
     private $sessionId = null;
-    private $timeout = 10; // Таймаут запросов в секундах
+    private $timeout = 10;
     
     public function __construct($apiKey, $login, $password)
     {
@@ -36,14 +36,13 @@ class DellinApi
             
             if ($response && isset($response['data']['sessionID'])) {
                 $this->sessionId = $response['data']['sessionID'];
-                $this->log("Авторизация успешна");
                 return true;
             } else {
-                $this->log("Ошибка авторизации: " . json_encode($response));
+                $this->log("Ошибка авторизации в API ДЛ");
                 return false;
             }
         } catch (\Throwable $e) {
-            $this->log("Исключение при авторизации: " . $e->getMessage());
+            $this->log("Ошибка авторизации: " . $e->getMessage());
             return false;
         }
     }
@@ -62,6 +61,21 @@ class DellinApi
             
             $url = $this->baseUrl . '/v3/orders.json';
             
+            // Пробуем найти по orderNumber
+            $payload = [
+                'appKey' => $this->apiKey,
+                'sessionID' => $this->sessionId,
+                'orderNumber' => $orderId
+            ];
+            
+            $response = $this->makeRequest($url, $payload);
+            
+            if ($response && isset($response['orders']) && count($response['orders']) > 0) {
+                $this->log("✓ Заказ {$orderId} найден");
+                return $this->parseOrderData($response['orders'][0]);
+            }
+            
+            // Если не нашли по orderNumber, пробуем по docIds
             $payload = [
                 'appKey' => $this->apiKey,
                 'sessionID' => $this->sessionId,
@@ -71,14 +85,29 @@ class DellinApi
             $response = $this->makeRequest($url, $payload);
             
             if ($response && isset($response['orders']) && count($response['orders']) > 0) {
-                $order = $response['orders'][0];
-                return $this->parseOrderData($order);
-            } else {
-                $this->log("Заказ не найден: " . $orderId);
-                return null;
+                $this->log("✓ Заказ {$orderId} найден");
+                return $this->parseOrderData($response['orders'][0]);
             }
+            
+            // Пробуем найти по orderId
+            $payload = [
+                'appKey' => $this->apiKey,
+                'sessionID' => $this->sessionId,
+                'orderId' => $orderId
+            ];
+            
+            $response = $this->makeRequest($url, $payload);
+            
+            if ($response && isset($response['orders']) && count($response['orders']) > 0) {
+                $this->log("✓ Заказ {$orderId} найден");
+                return $this->parseOrderData($response['orders'][0]);
+            }
+            
+            $this->log("✗ Заказ {$orderId} не найден");
+            return null;
+            
         } catch (\Throwable $e) {
-            $this->log("Исключение при получении заказа {$orderId}: " . $e->getMessage());
+            $this->log("Ошибка получения заказа {$orderId}: " . $e->getMessage());
             return null;
         }
     }
@@ -97,26 +126,43 @@ class DellinApi
         
         try {
             // Ожидаемая дата прихода
-            if (isset($order['delivery']['arrival']['planDate'])) {
-                $orderData['expected_arrival_date'] = $order['delivery']['arrival']['planDate'];
+            if (isset($order['orderDates']['arrivalToOspReceiver'])) {
+                $orderData['expected_arrival_date'] = $order['orderDates']['arrivalToOspReceiver'];
+            } elseif (isset($order['orderDates']['giveoutFromOspReceiverMax'])) {
+                $orderData['expected_arrival_date'] = $order['orderDates']['giveoutFromOspReceiverMax'];
+            } elseif (isset($order['orderDates']['giveoutFromOspReceiver'])) {
+                $orderData['expected_arrival_date'] = $order['orderDates']['giveoutFromOspReceiver'];
+            } elseif (isset($order['air']['arrivalDate'])) {
+                $orderData['expected_arrival_date'] = $order['air']['arrivalDate'];
             }
             
             // Вес, объём и количество мест
-            if (isset($order['cargo'])) {
-                $cargo = $order['cargo'];
+            if (isset($order['freight'])) {
+                $freight = $order['freight'];
                 
-                if (isset($cargo['weight'])) {
-                    $orderData['weight'] = floatval($cargo['weight']);
+                if (isset($freight['weight'])) {
+                    $orderData['weight'] = floatval($freight['weight']);
                 }
                 
-                if (isset($cargo['volume'])) {
-                    $orderData['volume'] = floatval($cargo['volume']);
+                if (isset($freight['volume'])) {
+                    $orderData['volume'] = floatval($freight['volume']);
                 }
                 
-                if (isset($cargo['quantity'])) {
-                    $orderData['places_count'] = intval($cargo['quantity']);
-                } elseif (isset($cargo['places']) && is_array($cargo['places'])) {
-                    $orderData['places_count'] = count($cargo['places']);
+                if (isset($freight['places'])) {
+                    $orderData['places_count'] = intval($freight['places']);
+                }
+            }
+            
+            // Если не нашли количество мест в freight, пробуем cargoPlaces
+            if (empty($orderData['places_count']) && isset($order['cargoPlaces']) && is_array($order['cargoPlaces'])) {
+                $totalPlaces = 0;
+                foreach ($order['cargoPlaces'] as $place) {
+                    if (isset($place['amount'])) {
+                        $totalPlaces += intval($place['amount']);
+                    }
+                }
+                if ($totalPlaces > 0) {
+                    $orderData['places_count'] = $totalPlaces;
                 }
             }
             
@@ -129,48 +175,50 @@ class DellinApi
     }
     
     /**
-     * Выполнение HTTP запроса с защитой от таймаутов
+     * Выполнение HTTP запроса
      */
     private function makeRequest($url, $data)
     {
         try {
-            $ch = curl_init($url);
+            $options = [
+                'http' => [
+                    'method' => 'POST',
+                    'header' => "Content-Type: application/json\r\n",
+                    'content' => json_encode($data),
+                    'timeout' => $this->timeout,
+                    'ignore_errors' => true
+                ],
+                'ssl' => [
+                    'verify_peer' => false,
+                    'verify_peer_name' => false
+                ]
+            ];
             
-            if ($ch === false) {
-                throw new \Exception("Не удалось инициализировать cURL");
-            }
-            
-            $headers = ['Content-Type: application/json'];
-            
-            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
-            curl_setopt($ch, CURLOPT_POST, true);
-            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
-            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-            curl_setopt($ch, CURLOPT_TIMEOUT, $this->timeout);
-            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, $this->timeout);
-            
-            $response = curl_exec($ch);
-            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            $error = curl_error($ch);
-            
-            curl_close($ch);
+            $context = stream_context_create($options);
+            $response = @file_get_contents($url, false, $context);
             
             if ($response === false) {
-                throw new \Exception("cURL error: " . $error);
+                throw new \Exception("Не удалось выполнить запрос");
+            }
+            
+            // Получаем HTTP код
+            $httpCode = 200;
+            if (isset($http_response_header[0])) {
+                preg_match('/\d{3}/', $http_response_header[0], $matches);
+                if (isset($matches[0])) {
+                    $httpCode = intval($matches[0]);
+                }
             }
             
             if ($httpCode >= 200 && $httpCode < 300) {
                 $decoded = json_decode($response, true);
                 if (json_last_error() !== JSON_ERROR_NONE) {
-                    throw new \Exception("JSON decode error: " . json_last_error_msg());
+                    throw new \Exception("Ошибка декодирования JSON");
                 }
                 return $decoded;
-            } else {
-                $this->log("HTTP {$httpCode}: " . substr($response, 0, 200));
-                return null;
             }
+            
+            return null;
             
         } catch (\Throwable $e) {
             $this->log("Ошибка запроса: " . $e->getMessage());
@@ -179,7 +227,7 @@ class DellinApi
     }
     
     /**
-     * Безопасное логирование
+     * Логирование
      */
     private function log($message)
     {
@@ -194,7 +242,7 @@ class DellinApi
             $timestamp = date('Y-m-d H:i:s');
             @file_put_contents($logFile, "[{$timestamp}] {$message}\n", FILE_APPEND);
         } catch (\Throwable $e) {
-            // Молча игнорируем ошибки логирования
+            // Игнорируем ошибки логирования
         }
     }
 }
