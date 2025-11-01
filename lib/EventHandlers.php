@@ -3,21 +3,34 @@
 namespace Dellin\Integration;
 
 use Bitrix\Main\Config\Option;
-use Bitrix\Crm\DealTable;
+use Bitrix\Main\Loader;
 
 class EventHandlers
 {
-    /**
-     * Обработчик изменения сделки
-     */
     public static function onDealUpdate(&$arFields)
     {
         try {
-            // Получаем ID сделки
+            // Используем глобальную переменную для защиты от повторных вызовов
+            global $DELLIN_PROCESSING;
+            if (!isset($DELLIN_PROCESSING)) {
+                $DELLIN_PROCESSING = [];
+            }
+            
+            if (!Loader::includeModule('crm')) {
+                return;
+            }
+            
             $dealId = $arFields['ID'] ?? null;
             if (!$dealId) {
                 return;
             }
+            
+            // Защита от повторного срабатывания
+            if (isset($DELLIN_PROCESSING[$dealId])) {
+                return;
+            }
+            
+            $DELLIN_PROCESSING[$dealId] = true;
             
             // Получаем настройки
             $apiKey = Option::get('dellin.integration', 'api_key');
@@ -34,8 +47,17 @@ class EventHandlers
             
             // Если номера заказа нет в изменениях - загружаем из базы
             if (empty($dellinOrderId)) {
-                $deal = DealTable::getById($dealId)->fetch();
-                $dellinOrderId = $deal[$dellinOrderField] ?? null;
+                $dbDeal = \CCrmDeal::GetListEx(
+                    [],
+                    ['ID' => $dealId, 'CHECK_PERMISSIONS' => 'N'],
+                    false,
+                    false,
+                    ['*', 'UF_*']
+                );
+                
+                if ($deal = $dbDeal->Fetch()) {
+                    $dellinOrderId = $deal[$dellinOrderField] ?? null;
+                }
             }
             
             if (empty($dellinOrderId)) {
@@ -50,7 +72,7 @@ class EventHandlers
                 return;
             }
             
-            // Обновляем сделку
+            // Обновляем сделку (внутри BitrixHelper проверка на изменения)
             $bitrixHelper = new BitrixHelper();
             $bitrixHelper->updateDeal($dealId, $orderData);
             

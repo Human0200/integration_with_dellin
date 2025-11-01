@@ -3,7 +3,7 @@
 namespace Dellin\Integration;
 
 use Bitrix\Main\Config\Option;
-use Bitrix\Crm\DealTable;
+use Bitrix\Main\Loader;
 
 class BitrixHelper
 {
@@ -13,6 +13,10 @@ class BitrixHelper
     public function updateDeal($dealId, $orderData)
     {
         try {
+            if (!Loader::includeModule('crm')) {
+                return false;
+            }
+            
             // Получаем коды полей из настроек
             $expectedDateField = Option::get('dellin.integration', 'field_expected_date', 'UF_CRM_EXPECTED_DATE');
             $weightField = Option::get('dellin.integration', 'field_weight', 'UF_CRM_CARGO_WEIGHT');
@@ -22,8 +26,15 @@ class BitrixHelper
             // Формируем данные для обновления
             $fields = [];
             
+            // Конвертируем дату из формата YYYY-MM-DD в DD.MM.YYYY
             if (!empty($orderData['expected_arrival_date'])) {
-                $fields[$expectedDateField] = $orderData['expected_arrival_date'];
+                $date = $orderData['expected_arrival_date'];
+                if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
+                    $dateObj = new \DateTime($date);
+                    $fields[$expectedDateField] = $dateObj->format('d.m.Y');
+                } else {
+                    $fields[$expectedDateField] = $date;
+                }
             }
             
             if (!empty($orderData['weight'])) {
@@ -39,24 +50,23 @@ class BitrixHelper
             }
             
             if (empty($fields)) {
-                $this->log("Нет данных для обновления сделки {$dealId}");
                 return false;
             }
             
             // Обновляем сделку
-            $result = DealTable::update($dealId, $fields);
+            $deal = new \CCrmDeal(false);
+            $result = $deal->Update($dealId, $fields);
             
-            if ($result->isSuccess()) {
-                $this->log("Сделка {$dealId} успешно обновлена: " . json_encode($fields));
+            if ($result) {
+                $this->log("✓ Сделка {$dealId} обновлена");
                 return true;
             } else {
-                $errors = $result->getErrorMessages();
-                $this->log("Ошибка обновления сделки {$dealId}: " . implode(', ', $errors));
+                $this->log("✗ Ошибка обновления сделки {$dealId}");
                 return false;
             }
             
-        } catch (\Exception $e) {
-            $this->log("Исключение при обновлении сделки {$dealId}: " . $e->getMessage());
+        } catch (\Throwable $e) {
+            $this->log("✗ Ошибка: " . $e->getMessage());
             return false;
         }
     }
@@ -66,15 +76,19 @@ class BitrixHelper
      */
     private function log($message)
     {
-        $logFile = $_SERVER['DOCUMENT_ROOT'] . '/local/logs/bitrix_helper.log';
-        
-        $logDir = dirname($logFile);
-        if (!is_dir($logDir)) {
-            mkdir($logDir, 0755, true);
+        try {
+            $logFile = $_SERVER['DOCUMENT_ROOT'] . '/local/logs/dellin_integration.log';
+            
+            $logDir = dirname($logFile);
+            if (!is_dir($logDir)) {
+                @mkdir($logDir, 0755, true);
+            }
+            
+            $timestamp = date('Y-m-d H:i:s');
+            @file_put_contents($logFile, "[{$timestamp}] {$message}\n", FILE_APPEND);
+        } catch (\Throwable $e) {
+            // Игнорируем
         }
-        
-        $timestamp = date('Y-m-d H:i:s');
-        file_put_contents($logFile, "[{$timestamp}] {$message}\n", FILE_APPEND);
     }
 }
 ?>
